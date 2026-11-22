@@ -1,0 +1,153 @@
+name: merge-assist-v3
+on:
+  workflow_dispatch:
+    inputs:
+      feature_branch:
+        required: true
+        default: feat/ss024-ss036-changed-since-cancellation
+      push:
+        required: false
+        default: "false"
+permissions:
+  contents: write
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.feature_branch }}
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - name: merge and resolve conflicts
+        run: |
+          set -euo pipefail
+          git config user.name "merge-assist"
+          git config user.email "merge-assist@users.noreply.github.com"
+          git remote add upstream https://github.com/StellarFoundry/soroban-security-scanner.git
+          git fetch upstream main
+          ORIG=$(git rev-parse HEAD)
+          echo "ORIG=$ORIG" >> "$GITHUB_ENV"
+          git merge --no-commit upstream/main || true
+          echo "=== conflicts ==="
+          git diff --name-only --diff-filter=U
+          git checkout --theirs -- crates/soroban-scan-core/tests/analysis_modes.rs
+          git add crates/soroban-scan-core/tests/analysis_modes.rs
+          git checkout --theirs -- crates/soroban-scan-cli/tests/cli.rs
+          sed -i 's/\["rules_run"\], 39)/["rules_run"], 41)/' crates/soroban-scan-cli/tests/cli.rs
+          cat >> crates/soroban-scan-cli/tests/cli.rs <<'RUSTEOF'
+
+          #[test]
+          fn changed_since_scans_only_changed_rust_files() {
+              let dir = std::env::temp_dir().join(format!("soroban-scan-changed-{}", std::process::id()));
+              let _ = std::fs::remove_dir_all(&dir);
+              std::fs::create_dir_all(dir.join("src")).expect("src");
+              let root = dir.as_path();
+              std::fs::write(root.join("src/unchanged.rs"), "pub fn unchanged() {}\n").expect("write");
+              std::fs::write(root.join("src/changed.rs"), "pub fn changed() {}\n").expect("write");
+
+              let run_git = |args: &[&str]| {
+                  let status = std::process::Command::new("git")
+                      .arg("-C")
+                      .arg(root)
+                      .args(args)
+                      .env("GIT_AUTHOR_NAME", "t")
+                      .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                      .env("GIT_COMMITTER_NAME", "t")
+                      .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                      .status()
+                      .expect("git is available");
+                  assert!(status.success());
+              };
+              run_git(&["init", "-q"]);
+              run_git(&["add", "."]);
+              run_git(&["commit", "-qm", "base"]);
+              std::fs::write(
+                  root.join("src/changed.rs"),
+                  "pub fn changed() { let _ = 1; }\n",
+              )
+              .expect("modify");
+
+              let list = root.join("changed.txt");
+              std::fs::write(&list, "src/changed.rs\n").expect("write list");
+              let output = run(&[
+                  "scan",
+                  root.to_str().unwrap(),
+                  "--changed-since",
+                  "HEAD",
+                  "--changed-from-file",
+                  list.to_str().unwrap(),
+                  "--format",
+                  "json",
+                  "--fail-on",
+                  "none",
+              ]);
+              assert_eq!(output.code, 0, "stderr: {}", output.stderr);
+              let value: ::serde_json::Value = ::serde_json::from_str(&output.stdout).expect("json report");
+              assert_eq!(value["stats"]["files_analyzed"], 1);
+          }
+          RUSTEOF
+          git add crates/soroban-scan-cli/tests/cli.rs
+          git checkout --theirs -- crates/soroban-scan-core/tests/snapshots/corpus.json
+          git checkout --theirs -- crates/soroban-scan-core/tests/snapshots/corpus.sarif
+          git add crates/soroban-scan-core/tests/snapshots/corpus.json crates/soroban-scan-core/tests/snapshots/corpus.sarif
+          git checkout --theirs -- crates/soroban-scan-core/src/rules/mod.rs
+          python3 - <<'PY'
+          import io
+          p = "crates/soroban-scan-core/src/rules/mod.rs"
+          s = io.open(p, encoding="utf-8", newline="").read()
+          def rep(a, b):
+              global s
+              assert s.count(a) == 1, (a, s.count(a))
+              s = s.replace(a, b)
+          rep("mod deprecated_sdk;", "mod deprecated_sdk;\nmod deprecated_sdk_api_usage;")
+          rep("mod missing_authorization;", "mod missing_authorization;\nmod missing_contracttype_on_boundary_types;")
+          rep("    registry.register(Box::new(unvalidated_token_address::UnvalidatedTokenAddress))?;", "    registry.register(Box::new(unvalidated_token_address::UnvalidatedTokenAddress))?;\n    registry.register(Box::new(\n        missing_contracttype_on_boundary_types::MissingContracttypeOnBoundaryTypes,\n    ))?;\n    registry.register(Box::new(deprecated_sdk_api_usage::DeprecatedSdkApiUsage))?;")
+          rep('"SS-023", "SS-025"', '"SS-023", "SS-024", "SS-025"')
+          rep('"SS-035", "SS-037"', '"SS-035", "SS-036", "SS-037"')
+          io.open(p, "w", encoding="utf-8", newline="").write(s)
+          PY
+          git add crates/soroban-scan-core/src/rules/mod.rs
+          python3 - <<'PY'
+          import io
+          p = "crates/soroban-scan-core/src/engine.rs"
+          s = io.open(p, encoding="utf-8", newline="").read()
+          old = "                    function.is_contract_entry_point\n                        && function.line <= finding.location.line\n                        && finding.location.line <= function.end_line"
+          new = "                    function.is_contract_entry_point && function.line == range.0"
+          assert s.count(old) == 1, s.count(old)
+          s = s.replace(old, new)
+          io.open(p, "w", encoding="utf-8", newline="").write(s)
+          PY
+          git add crates/soroban-scan-core/src/engine.rs
+          git commit -m "Merge upstream/main into feat/ss024-ss036-changed-since-cancellation"
+      - name: refresh expectations and snapshots
+        run: |
+          set -euo pipefail
+          UPDATE_EXPECTATIONS=1 cargo test -p soroban-scan-core --test corpus
+          UPDATE_SNAPSHOTS=1 cargo test -p soroban-scan-core --test report_snapshots
+          UPDATE_SNAPSHOTS=1 cargo test -p soroban-scan-core --test finding_counts
+          cargo fmt --all
+          git add -A
+          git commit -m "test: refresh corpus expectations and report snapshots for SS-024/SS-036" || echo "no changes"
+      - name: gate fmt
+        run: cargo fmt --all -- --check
+      - name: gate clippy
+        run: set -o pipefail; cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee gate-clippy.log
+      - name: gate test
+        run: set -o pipefail; cargo test --all --all-features 2>&1 | tee gate-test.log
+      - name: diff patch
+        if: always()
+        run: git diff "${ORIG:-HEAD}" HEAD > merge.patch || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: merge-result
+          path: |
+            merge.patch
+            gate-clippy.log
+            gate-test.log
+          if-no-files-found: ignore
+      - name: push
+        if: ${{ inputs.push == 'true' }}
+        run: git push origin HEAD:${{ inputs.feature_branch }}
